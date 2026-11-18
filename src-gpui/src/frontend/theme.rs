@@ -7,6 +7,7 @@ use gpui_kit::*;
 pub const LABEL_WEIGHT: FontWeight = FontWeight::MEDIUM;
 
 #[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Default))]
 pub struct Palette {
     pub ink: Hsla,
     pub muted: Hsla,
@@ -30,6 +31,7 @@ pub struct Palette {
     pub io: Hsla,
     pub network: Hsla,
     pub gpu: Hsla,
+    pub npu: Hsla,
     pub battery: Hsla,
     pub danger: Hsla,
     /// The process list's categories (`processes.section.*`): apps,
@@ -172,6 +174,7 @@ impl Palette {
             io: colors.chart_3,
             network: colors.chart_4,
             gpu: colors.chart_5,
+            npu: token("npu", dark),
             battery: colors.chart_bullish,
             danger: role(cx, "danger"),
             group_apps: token("group-apps", dark),

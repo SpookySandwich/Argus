@@ -32,6 +32,7 @@
     "disk": "Disco",
     "network": "Red",
     "gpu": "GPU",
+    "npu": "NPU",
     "battery": "Batería",
     "temperature": "Temperatura"
   },

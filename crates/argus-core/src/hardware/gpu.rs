@@ -64,9 +64,9 @@ pub enum GpuUtilSource {
 
 /// Each node owns its baseline: zero is valid and a failed query breaks the pair.
 #[derive(Default)]
-struct NodeCounter(Option<(i64, Instant)>);
+pub(super) struct NodeCounter(Option<(i64, Instant)>);
 impl NodeCounter {
-    fn sample(&mut self, running: Option<i64>, now: Instant) -> Option<f32> {
+    pub(super) fn sample(&mut self, running: Option<i64>, now: Instant) -> Option<f32> {
         let Some(running) = running.filter(|v| *v >= 0) else {
             self.0 = None;
             return None;
@@ -180,12 +180,13 @@ impl GpuTracker {
             ignored: self.ignored.clone(),
         }
     }
-    pub fn new() -> Self {
-        Self::new_with_vendor(true)
+    pub fn new(excluded: &HashSet<u64>) -> Self {
+        Self::new_with_vendor(true, excluded)
     }
 
-    pub(super) fn new_with_vendor(vendor_telemetry: bool) -> Self {
-        let (adapters, ignored) = startup_phase("gpu.enumerate", enumerate).unwrap_or_default();
+    pub(super) fn new_with_vendor(vendor_telemetry: bool, excluded: &HashSet<u64>) -> Self {
+        let (adapters, ignored) = startup_phase("gpu.enumerate", || enumerate(excluded))
+            .unwrap_or_else(|| (Vec::new(), excluded.clone()));
         let mut tracker = Self {
             adapters,
             ignored,
@@ -218,8 +219,8 @@ impl GpuTracker {
     /// handles and counter baselines; LUIDs of `unknown` that this enumeration
     /// does not return either are ignored from now on, so each causes one
     /// successful enumeration at most. A failed enumeration changes nothing.
-    pub(crate) fn refresh(&mut self, unknown: &HashSet<u64>) {
-        let Some((found, mut ignored)) = enumerate() else {
+    pub(crate) fn refresh(&mut self, unknown: &HashSet<u64>, excluded: &HashSet<u64>) {
+        let Some((found, mut ignored)) = enumerate(excluded) else {
             crate::diagnostics::warn("gpu.enumerate", "adapters could not be enumerated again");
             return;
         };
@@ -278,19 +279,7 @@ impl GpuTracker {
                     integrated_sensors: None,
                 };
                 for (node, prev) in a.prev_running.iter_mut().enumerate() {
-                    let mut q = statistics_query(D3DKMT_QUERYSTATISTICS_NODE, a.luid);
-                    q.Anonymous.QueryNode.NodeId = node as u32;
-                    let running = if startup_native(
-                        "gpu.node-statistics",
-                        luid_key(a.luid),
-                        node as u32,
-                        || unsafe { D3DKMTQueryStatistics(&raw mut q) }.0,
-                    ) >= 0
-                    {
-                        Some(unsafe { q.QueryResult.NodeInformation.GlobalInformation.RunningTime })
-                    } else {
-                        None
-                    };
+                    let running = node_running_time("gpu.node-statistics", a.luid, node as u32);
                     if let Some(pct) = prev.sample(running, Instant::now()) {
                         let e = a.node_engine[node];
                         stats.engines[e] = stats.engines[e].max(pct);
@@ -389,7 +378,11 @@ fn close(handle: u32, luid: LUID) {
 /// The adapters of a new enumeration in its order, each one taken from
 /// `previous` when it is there (its handle and counter baselines stay), and
 /// the adapters to close: the new duplicates and those that are gone.
-fn reconcile<T>(mut previous: Vec<T>, found: Vec<T>, key: impl Fn(&T) -> u64) -> (Vec<T>, Vec<T>) {
+pub(super) fn reconcile<T>(
+    mut previous: Vec<T>,
+    found: Vec<T>,
+    key: impl Fn(&T) -> u64,
+) -> (Vec<T>, Vec<T>) {
     let mut adapters = Vec::with_capacity(found.len());
     let mut closed = Vec::new();
     for adapter in found {
@@ -405,7 +398,7 @@ fn reconcile<T>(mut previous: Vec<T>, found: Vec<T>, key: impl Fn(&T) -> u64) ->
     (adapters, closed)
 }
 
-fn luid_key(luid: LUID) -> u64 {
+pub(super) fn luid_key(luid: LUID) -> u64 {
     (u64::from(luid.HighPart as u32) << 32) | u64::from(luid.LowPart)
 }
 
@@ -418,6 +411,32 @@ fn statistics_query(
     q.Type = kind;
     q.AdapterLuid = luid;
     q
+}
+
+pub(super) fn adapter_statistics(phase: &'static str, luid: LUID) -> Option<(u32, u32)> {
+    let mut stats = statistics_query(D3DKMT_QUERYSTATISTICS_ADAPTER, luid);
+    if startup_native(phase, luid_key(luid), 0, || {
+        unsafe { D3DKMTQueryStatistics(&raw mut stats) }.0
+    }) >= 0
+    {
+        let i = unsafe { &stats.QueryResult.AdapterInformation };
+        Some((i.NodeCount, i.NbSegments))
+    } else {
+        None
+    }
+}
+
+pub(super) fn node_running_time(phase: &'static str, luid: LUID, node: u32) -> Option<i64> {
+    let mut q = statistics_query(D3DKMT_QUERYSTATISTICS_NODE, luid);
+    q.Anonymous.QueryNode.NodeId = node;
+    if startup_native(phase, luid_key(luid), node, || {
+        unsafe { D3DKMTQueryStatistics(&raw mut q) }.0
+    }) >= 0
+    {
+        Some(unsafe { q.QueryResult.NodeInformation.GlobalInformation.RunningTime })
+    } else {
+        None
+    }
 }
 
 fn query_info<T>(handle: u32, kind: KMTQUERYADAPTERINFOTYPE, data: &mut T) -> bool {
@@ -473,20 +492,26 @@ fn adapter_list() -> Option<Vec<D3DKMT_ADAPTERINFO>> {
 }
 
 /// The adapters to list and the LUIDs of the others; None when the adapters
-/// could not be enumerated.
-fn enumerate() -> Option<(Vec<Adapter>, HashSet<u64>)> {
+/// could not be enumerated. `excluded` carries adapters owned by another class
+/// (such as NPUs) so neither hybrid WDDM drivers nor PDH engine counters fold
+/// them into the GPU list.
+fn enumerate(excluded: &HashSet<u64>) -> Option<(Vec<Adapter>, HashSet<u64>)> {
     let list = adapter_list()?;
     let mut out = Vec::new();
-    let mut ignored = HashSet::new();
+    let mut ignored = excluded.clone();
     if list.is_empty() {
         return Some((out, ignored));
     }
     let mut metadata = startup_phase("gpu.metadata", metadata::Metadata::new);
     for a in list {
-        match describe(&a, &mut metadata) {
+        let key = luid_key(a.AdapterLuid);
+        let adapter = (!excluded.contains(&key))
+            .then(|| describe(&a, &mut metadata))
+            .flatten();
+        match adapter {
             Some(adapter) => out.push(adapter),
             None => {
-                ignored.insert(luid_key(a.AdapterLuid));
+                ignored.insert(key);
                 close(a.hAdapter, a.AdapterLuid);
             }
         }
@@ -507,20 +532,7 @@ fn describe(a: &D3DKMT_ADAPTERINFO, metadata: &mut metadata::Metadata) -> Option
         }
     }
 
-    let mut stats = statistics_query(D3DKMT_QUERYSTATISTICS_ADAPTER, a.AdapterLuid);
-    if startup_native(
-        "gpu.adapter-statistics",
-        luid_key(a.AdapterLuid),
-        0,
-        || unsafe { D3DKMTQueryStatistics(&raw mut stats) }.0,
-    ) < 0
-    {
-        return None;
-    }
-    let (nodes, segments) = unsafe {
-        let i = &stats.QueryResult.AdapterInformation;
-        (i.NodeCount, i.NbSegments)
-    };
+    let (nodes, segments) = adapter_statistics("gpu.adapter-statistics", a.AdapterLuid)?;
 
     let mut registry: Box<D3DKMT_ADAPTERREGISTRYINFO> = Box::new(unsafe { std::mem::zeroed() });
     let name = if query_info(
