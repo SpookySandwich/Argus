@@ -1,0 +1,14 @@
+name: Windows renderer regression check
+on: push
+permissions:
+  contents: read
+jobs:
+  vendor:
+    if: github.ref == 'refs/heads/validation/power-renderer-88df8102'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.100.0-x86_64-pc-windows-msvc --profile minimal --no-self-update
+      - run: cargo +1.100.0 test --locked -p gpui-pre-windows --lib
