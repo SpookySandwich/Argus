@@ -4,7 +4,7 @@
 //! is downloaded right away but installed only when the user asks, because
 //! installing exits Argus. Each channel has a manifest attached to the latest
 //! stable release (`latest.json`, `beta.json`, written by the release
-//! workflow), fetched from GitHub, the official mirror, or a GitHub proxy. The
+//! workflow), fetched directly from this fork on GitHub. The
 //! installer must carry a signature from the key in resources/app.json that also
 //! covers its version (the trusted comment's `version:`), so a proxy can
 //! withhold an update but not alter or downgrade one. The release notes the
@@ -28,12 +28,10 @@ use crate::update_transport::{Error, Update};
 use argus_core::tr;
 use serde::{Deserialize, Serialize};
 
-use crate::settings::{SettingsStore, UpdateChannel, UpdateRoute};
+use crate::settings::{SettingsStore, UpdateChannel};
 
-/// The upstream repository and its official release distribution hosts.
-pub(crate) const REPO: &str = "https://github.com/Ray-lea/Argus";
-const OFFICIAL_FEEDS: &str = "https://update.argustask.com";
-const OFFICIAL_DOWNLOADS: &str = "https://dl.argustask.com";
+/// Repository that publishes this build and owns its updater key.
+pub(crate) const REPO: &str = "https://github.com/SpookySandwich/Argus";
 /// Public GitHub proxies that served release downloads byte for byte when
 /// they were picked (2026-10). They come and go; users can enter their own.
 pub use argus_app::config::PROXY_PRESETS;
@@ -415,22 +413,11 @@ pub fn reset(app: &Host) {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum ReleaseSource {
-    GitHub,
-    Official,
-    Proxy(String),
-}
+struct ReleaseSource;
 
 impl ReleaseSource {
     fn label(&self) -> String {
-        match self {
-            Self::GitHub => "GitHub".into(),
-            Self::Official => "argustask.com".into(),
-            Self::Proxy(prefix) => Url::parse(prefix)
-                .ok()
-                .and_then(|url| url.host_str().map(str::to_owned))
-                .unwrap_or_else(|| "proxy".into()),
-        }
+        "GitHub".into()
     }
 
     fn manifest(&self, channel: UpdateChannel) -> Result<Url, String> {
@@ -438,60 +425,19 @@ impl ReleaseSource {
             UpdateChannel::Stable => "latest.json",
             UpdateChannel::Beta => "beta.json",
         };
-        match self {
-            Self::Official => via(&format!("{OFFICIAL_FEEDS}/{file}"), None),
-            Self::GitHub => via(&format!("{REPO}/releases/latest/download/{file}"), None),
-            Self::Proxy(prefix) => via(
-                &format!("{REPO}/releases/latest/download/{file}"),
-                Some(prefix),
-            ),
-        }
+        Url::parse(&format!("{REPO}/releases/latest/download/{file}")).map_err(|e| e.to_string())
     }
 
     fn artifact(&self, original: &Url, version: &str) -> Result<Url, String> {
         let file = file_name(version).ok_or_else(|| tr!("updater.invalidVersion"))?;
-        let upstream = format!("{REPO}/releases/download/v{version}/{file}");
-        let mirror = format!("{OFFICIAL_DOWNLOADS}/v{version}/{file}");
-        let github_url = if original.as_str() == mirror {
-            upstream.as_str()
-        } else {
-            original.as_str()
-        };
-        match self {
-            Self::GitHub => via(github_url, None),
-            Self::Proxy(prefix) => via(github_url, Some(prefix)),
-            Self::Official if github_url == upstream => via(&mirror, None),
-            Self::Official => Err(tr!("updater.notFound")),
+        let expected = format!("{REPO}/releases/download/v{version}/{file}");
+        if original.as_str() != expected {
+            return Err(tr!("updater.notFound"));
         }
+        Ok(original.clone())
     }
 }
 
-fn sources(route: UpdateRoute, proxy: &str) -> Vec<ReleaseSource> {
-    match route {
-        UpdateRoute::Direct => vec![ReleaseSource::GitHub],
-        UpdateRoute::Proxy => vec![ReleaseSource::Proxy(proxy.into())],
-        UpdateRoute::Auto => {
-            let mut all = vec![
-                ReleaseSource::GitHub,
-                ReleaseSource::Official,
-                ReleaseSource::Proxy(proxy.into()),
-            ];
-            all.extend(
-                PROXY_PRESETS
-                    .into_iter()
-                    .filter(|preset| *preset != proxy)
-                    .map(|preset| ReleaseSource::Proxy(preset.into())),
-            );
-            all
-        }
-    }
-}
-
-fn via(url: &str, source: Option<&str>) -> Result<Url, String> {
-    Url::parse(&format!("{}{url}", source.unwrap_or_default())).map_err(|e| e.to_string())
-}
-
-/// Checks that a proxy prefix is an https URL the GitHub URL can follow.
 pub fn normalize_proxy(proxy: &str) -> Result<String, String> {
     let proxy = proxy.trim();
     let url = Url::parse(proxy).map_err(|_| tr!("updater.proxyInvalid"))?;
@@ -729,7 +675,7 @@ async fn check_once(app: &Host, generation: u64) {
     }
 
     let settings = app.state::<SettingsStore>().get();
-    let sources = sources(settings.update_route, &settings.update_proxy);
+    let sources = [ReleaseSource];
     // What each source said: for the dialog, and (`causes`) for the log.
     let mut failures = Vec::new();
     let mut causes = Vec::new();
@@ -1329,81 +1275,31 @@ mod tests {
     }
 
     #[test]
-    fn sources_follow_the_route() {
-        let proxy = "https://example.org/";
-        assert_eq!(
-            sources(UpdateRoute::Direct, proxy),
-            vec![ReleaseSource::GitHub]
-        );
-        assert_eq!(
-            sources(UpdateRoute::Proxy, proxy),
-            vec![ReleaseSource::Proxy(proxy.into())]
-        );
-        let auto = sources(UpdateRoute::Auto, PROXY_PRESETS[1]);
-        assert_eq!(auto[0], ReleaseSource::GitHub);
-        assert_eq!(auto[1], ReleaseSource::Official);
-        assert_eq!(auto[2], ReleaseSource::Proxy(PROXY_PRESETS[1].into()));
-        assert_eq!(auto.len(), 2 + PROXY_PRESETS.len());
-    }
-
-    #[test]
-    fn proxies_prefix_the_github_url() {
-        let url = via(
-            "https://github.com/a/b/x.json",
-            Some("https://gh-proxy.com/"),
-        )
-        .unwrap();
-        assert_eq!(
-            url.as_str(),
-            "https://gh-proxy.com/https://github.com/a/b/x.json"
-        );
-        assert_eq!(
-            ReleaseSource::Proxy("https://gh-proxy.com/".into()).label(),
-            "gh-proxy.com"
-        );
-        assert_eq!(ReleaseSource::GitHub.label(), "GitHub");
-    }
-
-    #[test]
-    fn mirrored_manifests_and_installers_fall_back_to_the_same_upstream_version() {
-        let version = "1.2.3-beta.1";
-        let upstream = Url::parse(&format!(
-            "{REPO}/releases/download/v{version}/Argus_{version}_x64-setup.exe"
-        ))
-        .unwrap();
-        let mirror = ReleaseSource::Official
-            .artifact(&upstream, version)
-            .unwrap();
-        assert_eq!(mirror.host_str(), Some("dl.argustask.com"));
-        assert_eq!(
-            ReleaseSource::GitHub.artifact(&mirror, version).unwrap(),
-            upstream
-        );
-        assert_eq!(
-            ReleaseSource::Proxy("https://example.org/".into())
-                .artifact(&mirror, version)
-                .unwrap()
-                .as_str(),
-            format!("https://example.org/{upstream}")
-        );
-        assert!(
-            ReleaseSource::Official
-                .artifact(&upstream, "1.2.2")
-                .is_err()
-        );
+    fn both_channels_and_versioned_artifacts_belong_to_the_fork() {
+        let source = ReleaseSource;
         for (channel, file) in [
             (UpdateChannel::Stable, "latest.json"),
             (UpdateChannel::Beta, "beta.json"),
         ] {
             assert_eq!(
-                ReleaseSource::Official.manifest(channel).unwrap().as_str(),
-                format!("{OFFICIAL_FEEDS}/{file}")
-            );
-            assert_eq!(
-                ReleaseSource::GitHub.manifest(channel).unwrap().as_str(),
+                source.manifest(channel).unwrap().as_str(),
                 format!("{REPO}/releases/latest/download/{file}")
             );
         }
+        let url = Url::parse(&format!(
+            "{REPO}/releases/download/v0.5.1/Argus_0.5.1_x64-setup.exe"
+        ))
+        .unwrap();
+        assert_eq!(source.artifact(&url, "0.5.1").unwrap(), url);
+        assert!(source.artifact(&url, "0.5.2").is_err());
+        assert!(
+            source
+                .artifact(
+                    &Url::parse("https://example.org/setup.exe").unwrap(),
+                    "0.5.1"
+                )
+                .is_err()
+        );
     }
 
     #[test]

@@ -1,0 +1,131 @@
+name: Custom release
+on:
+  push:
+    branches: [custom]
+  workflow_dispatch:
+  schedule:
+    - cron: '27 7 * * *'
+
+permissions: {}
+concurrency:
+  group: custom-release
+  cancel-in-progress: false
+
+jobs:
+  source:
+    if: github.repository == 'SpookySandwich/Argus' && github.ref == 'refs/heads/custom'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      build: ${{ steps.source.outputs.build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: custom
+          fetch-depth: 0
+      - id: source
+        name: Select source and integrate clean upstream changes
+        env:
+          EVENT: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == schedule ]]; then
+            git fetch --no-tags https://github.com/Ray-lea/Argus.git refs/heads/main
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git merge --no-edit FETCH_HEAD
+            git push origin HEAD:refs/heads/custom
+          fi
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          build=true
+          if [[ "$EVENT" == schedule ]]; then
+            tag=$(gh release list --exclude-drafts --exclude-pre-releases --json tagName,isLatest --jq '.[] | select(.isLatest) | .tagName')
+            if [[ -n "$tag" && "$(git rev-list -1 "$tag")" == "$sha" ]]; then build=false; fi
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: source
+    if: needs.source.outputs.build == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 100
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      ARGUS_BUILD_METADATA: ''
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.source.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+      - name: Prepare version and toolchain
+        run: |
+          version=$(node scripts/release.mjs custom-version "$GITHUB_RUN_NUMBER")
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --no-self-update
+          rustup default stable-x86_64-pc-windows-msvc
+          choco install nsis --version=3.13 -y --no-progress
+      - name: Build installer and updater signer
+        run: |
+          cargo metadata --locked --no-deps --format-version=1 > /dev/null
+          node scripts/build.mjs --installer
+          cargo build --locked --release -p argus-update-signer
+      - name: Assemble downloads and release notes
+        shell: pwsh
+        run: |
+          $version = $env:VERSION
+          $name = "Argus_${version}_x64"
+          New-Item -ItemType Directory assets | Out-Null
+          Copy-Item "target/release/bundle/nsis/$name-setup.exe" assets
+          Compress-Archive -LiteralPath target/release/argus.exe -DestinationPath "assets/$name-portable.zip"
+          $date = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd')
+          $text = "Custom fork build $version. Includes NPU monitoring and background power optimizations. Source commit $(git rev-parse HEAD)."
+          @{version=$version; releases=@(@{version=$version;date=$date;notes=$text})} | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8NoBOM release-notes.json
+      - name: Sign installer, portable archive and notes
+        env:
+          ARGUS_SIGNING_PRIVATE_KEY: ${{ secrets.CUSTOM_UPDATE_PRIVATE_KEY }}
+          ARGUS_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.CUSTOM_UPDATE_PASSWORD }}
+        run: |
+          for file in assets/* release-notes.json; do
+            target/release/argus-update-signer.exe "$VERSION" "$file"
+            node scripts/release.mjs check-signature "$VERSION" "$file" "$file.sig"
+          done
+      - name: Write and sign update manifests
+        shell: pwsh
+        env:
+          ARGUS_SIGNING_PRIVATE_KEY: ${{ secrets.CUSTOM_UPDATE_PRIVATE_KEY }}
+          ARGUS_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.CUSTOM_UPDATE_PASSWORD }}
+        run: |
+          $v = $env:VERSION
+          $file = "Argus_${v}_x64-setup.exe"
+          $asset = @{url="https://github.com/$env:GITHUB_REPOSITORY/releases/download/v$v/$file"; signature=(Get-Content -Raw "assets/$file.sig").Trim()}
+          $manifest = @{
+            version=$v; pub_date=[DateTimeOffset]::UtcNow.ToString('o'); notes="Custom fork build $v"
+            platforms=@{'windows-x86_64-nsis'=$asset; 'windows-x86_64'=$asset}
+            argus=@{releaseNotes=(Get-Content -Raw release-notes.json); signature=(Get-Content -Raw release-notes.json.sig).Trim()}
+          }
+          $manifest | ConvertTo-Json -Depth 6 | Set-Content -Encoding utf8NoBOM assets/latest.json
+          target/release/argus-update-signer.exe $v assets/latest.json
+          if ($LASTEXITCODE) {exit $LASTEXITCODE}
+          node scripts/release.mjs check-signature $v assets/latest.json assets/latest.json.sig
+          if ($LASTEXITCODE) {exit $LASTEXITCODE}
+          Copy-Item assets/latest.json assets/beta.json
+      - name: Publish verified assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE: ${{ needs.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          (cd assets && sha256sum -- * > SHA256SUMS.txt)
+          gh release create "v$VERSION" assets/* --target "$SOURCE" --latest --title "Argus custom $VERSION" \
+            --notes "Windows x64 custom build from $SOURCE. Use the NSIS installer for in-app updates or extract the portable zip. The installer, portable archive and update manifest carry the fork's minisign signatures."

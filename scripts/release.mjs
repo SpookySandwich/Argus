@@ -722,6 +722,16 @@ function cmdCheckSignature([version, file, signature]) {
 
 const [command, ...args] = process.argv.slice(2);
 const commands = {
+  // Stamp only the disposable CI checkout. Source branches retain the upstream version.
+  "custom-version": ([run]) => {
+    if (!/^[1-9]\d*$/.test(run)) fail("Invalid workflow run number");
+    const [major, minor, patch] = readVersion().split(/[-+]/)[0].split(".").map(Number);
+    const next = patch + Number(run);
+    if (next > 65535) fail("Patch version exceeds the Windows file version limit");
+    const version = `${major}.${minor}.${next}`;
+    writeVersion(version);
+    console.log(version);
+  },
   bump: cmdBump,
   lint: cmdLint,
   verify: cmdVerify,
